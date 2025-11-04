@@ -26,4 +26,4 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         with:
-          model: huggingface/zai-org/GLM-4.5-Air
+          model: Qwen/Qwen3-Coder-480B-A35B-Instruct
