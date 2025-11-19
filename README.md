@@ -52,6 +52,14 @@
 pip install datasets
 ```
 
+## With uv
+
+🤗 Datasets can be installed using uv as follows:
+
+```bash
+uv pip install datasets
+```
+
 ## With conda
 
 🤗 Datasets can be installed using conda as follows:
