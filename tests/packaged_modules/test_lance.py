@@ -3,7 +3,8 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-from datasets import load_dataset
+from datasets import DownloadConfig, load_dataset
+from datasets.packaged_modules.lance.lance import _resolve_storage_options
 
 
 @pytest.fixture
@@ -89,6 +90,82 @@ def test_load_vectors(lance_hf_dataset):
     assert "vector" in dataset.column_names
     vectors = dataset.data["vector"].combine_chunks().values.to_numpy(zero_copy_only=False)
     assert np.allclose(vectors, np.full(16, 0.1))
+
+
+HF_FILES = ["hf://datasets/user/repo/data/train.lance/_versions/1.manifest"]
+
+
+def test_resolve_storage_options_local_files():
+    assert _resolve_storage_options(["/local/path/train.lance/_versions/1.manifest"], DownloadConfig()) is None
+
+
+def test_resolve_storage_options_hf_token_from_download_config(monkeypatch):
+    # `get_dataset_split_names(..., token=...)` (e.g. the dataset-viewer): storage_options
+    # is empty and the token only lives on download_config.token
+    monkeypatch.setattr("huggingface_hub.utils._headers.get_token", lambda: None)
+    storage_options = _resolve_storage_options(HF_FILES, DownloadConfig(token="hf_secret"))
+    assert storage_options == {"token": "hf_secret"}
+
+
+def test_resolve_storage_options_hf_ambient_token(monkeypatch):
+    # No explicit token anywhere: fall back to the locally saved token, like HfFileSystem does
+    monkeypatch.setattr("huggingface_hub.constants.HF_HUB_DISABLE_IMPLICIT_TOKEN", False)
+    monkeypatch.setattr("huggingface_hub.utils._headers.get_token", lambda: "hf_ambient")
+    storage_options = _resolve_storage_options(HF_FILES, DownloadConfig())
+    assert storage_options == {"token": "hf_ambient"}
+
+
+def test_resolve_storage_options_drops_none_values(monkeypatch):
+    # `load_dataset(..., streaming=True)` populates storage_options["hf"] with token=None,
+    # which lance's bindings reject with a TypeError if passed through
+    monkeypatch.setattr("huggingface_hub.utils._headers.get_token", lambda: None)
+    download_config = DownloadConfig()
+    download_config.storage_options = {"hf": {"endpoint": "https://huggingface.co", "token": None}}
+    storage_options = _resolve_storage_options(HF_FILES, download_config)
+    assert storage_options == {"endpoint": "https://huggingface.co"}
+
+
+def test_resolve_storage_options_config_token_precedence(monkeypatch):
+    # An explicit LanceConfig(token=...) wins over download_config and the ambient token
+    monkeypatch.setattr("huggingface_hub.utils._headers.get_token", lambda: "hf_ambient")
+    storage_options = _resolve_storage_options(HF_FILES, DownloadConfig(token="hf_dc"), token="hf_config")
+    assert storage_options == {"token": "hf_config"}
+
+
+def test_resolve_storage_options_hf_storage_options_token_overrides_download_config_token():
+    # Protocol-specific storage options override the top-level token, like in the fsspec path
+    # preparation ({"token": token, **storage_options})
+    download_config = DownloadConfig(token="hf_top")
+    download_config.storage_options = {"hf": {"token": "hf_storage"}}
+    assert _resolve_storage_options(HF_FILES, download_config) == {"token": "hf_storage"}
+
+
+def test_resolve_storage_options_hf_storage_options_false_disables_auth():
+    # storage_options={"hf": {"token": False}} explicitly disables auth even with a top-level token
+    download_config = DownloadConfig(token="hf_top")
+    download_config.storage_options = {"hf": {"token": False}}
+    assert _resolve_storage_options(HF_FILES, download_config) is None
+
+
+def test_resolve_storage_options_token_true_uses_ambient_token(monkeypatch):
+    # token=True means "use the ambient token" (huggingface_hub convention); passing the
+    # raw True to lance would raise the same dict[str, str] TypeError
+    monkeypatch.setattr("huggingface_hub.utils._headers.get_token", lambda: "hf_ambient")
+    storage_options = _resolve_storage_options(HF_FILES, DownloadConfig(token=True))
+    assert storage_options == {"token": "hf_ambient"}
+
+
+def test_resolve_storage_options_token_false_stays_anonymous(monkeypatch):
+    # token=False is an explicit opt-out of authentication: don't fall back to the ambient token
+    monkeypatch.setattr("huggingface_hub.utils._headers.get_token", lambda: "hf_ambient")
+    assert _resolve_storage_options(HF_FILES, DownloadConfig(token=False)) is None
+
+
+def test_resolve_storage_options_non_hf_protocol_passthrough():
+    download_config = DownloadConfig()
+    download_config.storage_options = {"s3": {"key": "abc", "secret": None}}
+    storage_options = _resolve_storage_options(["s3://bucket/train.lance/_versions/1.manifest"], download_config)
+    assert storage_options == {"key": "abc"}
 
 
 @pytest.mark.parametrize("streaming", [False, True])

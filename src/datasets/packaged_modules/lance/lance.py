@@ -1,10 +1,11 @@
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 import pyarrow as pa
 from huggingface_hub import HfApi
+from huggingface_hub.utils import get_token_to_send
 
 import datasets
 from datasets import Audio, Image, Video
@@ -89,6 +90,38 @@ def _fix_local_version_file(uri: str) -> str:
     return uri
 
 
+def _resolve_hf_token(download_config, token: Optional[Union[bool, str]] = None) -> Optional[str]:
+    """Resolve the Hugging Face token to use: the explicit `token` wins, then a token in
+    `download_config.storage_options["hf"]` (protocol-specific options override the top-level
+    token, like in the fsspec path preparation), then `download_config.token`. The
+    `str`/`True`/`False`/`None` semantics are `huggingface_hub`'s (`True` and `None` use the
+    ambient token, `False` disables authentication)."""
+    hf_storage_options = download_config.storage_options.get("hf") or {}
+    token = next((t for t in (token, hf_storage_options.get("token"), download_config.token) if t is not None), None)
+    return get_token_to_send(token)
+
+
+def _resolve_storage_options(
+    files: List[str], download_config, token: Optional[Union[bool, str]] = None
+) -> Optional[Dict[str, Any]]:
+    """Build the storage options to pass to lance for reading `files`.
+
+    Lance's bindings require string values (a `None` value raises a `TypeError`), so `None`
+    values are stripped; other values are passed through as-is. Lance's `hf://` object store
+    does not fall back to the locally saved Hugging Face token (only the `HF_TOKEN` environment
+    variable), so the token must be set explicitly for private repos.
+    `download_config.storage_options` can't be passed through as-is: depending on the code path
+    it can be missing the `hf` entry entirely (e.g. `get_dataset_split_names()` without a token)
+    or contain `{"token": None}` (e.g. `load_dataset(..., streaming=True)`), and the token itself
+    can be `True`/`False`, which lance doesn't understand.
+    """
+    protocol = files[0].split("://", 1)[0] if "://" in files[0] else None
+    storage_options = dict(download_config.storage_options.get(protocol) or {}) if protocol else {}
+    if protocol == "hf":
+        storage_options["token"] = _resolve_hf_token(download_config, token=token)
+    return {key: value for key, value in storage_options.items() if value is not None} or None
+
+
 class Lance(datasets.ArrowBasedBuilder, datasets.builder._CountableBuilderMixin):
     BUILDER_CONFIG_CLASS = LanceConfig
     METADATA_EXTENSIONS = [".idx", ".txn", ".manifest"]
@@ -104,7 +137,9 @@ class Lance(datasets.ArrowBasedBuilder, datasets.builder._CountableBuilderMixin)
         if not self.config.data_files:
             raise ValueError(f"At least one data file must be specified, but got data_files={self.config.data_files}")
         if self.repo_id:
-            api = HfApi(**dl_manager.download_config.storage_options.get("hf", {}))
+            hf_endpoint = (dl_manager.download_config.storage_options.get("hf") or {}).get("endpoint")
+            hf_token = _resolve_hf_token(dl_manager.download_config, token=self.config.token)
+            api = HfApi(endpoint=hf_endpoint, token=hf_token if hf_token is not None else False)
             dataset_sha = api.dataset_info(self.repo_id).sha
             if dataset_sha != self.hash:
                 raise NotImplementedError(
@@ -119,7 +154,7 @@ class Lance(datasets.ArrowBasedBuilder, datasets.builder._CountableBuilderMixin)
 
         splits: list[datasets.SplitGenerator] = []
         for split_name, files in data_files.items():
-            storage_options = dl_manager.download_config.storage_options.get(files[0].split("://", 1)[0])
+            storage_options = _resolve_storage_options(files, dl_manager.download_config, token=self.config.token)
 
             lance_dataset_uris = resolve_dataset_uris(files)
             if lance_dataset_uris:
