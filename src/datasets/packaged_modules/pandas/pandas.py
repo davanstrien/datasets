@@ -1,13 +1,18 @@
-import itertools
 import warnings
 from dataclasses import dataclass
 from typing import Optional
 
-import pandas as pd
 import pyarrow as pa
 
 import datasets
 from datasets.table import table_cast
+
+
+PANDAS_PICKLE_DISABLED_ERROR = (
+    "Pickle loading with the pandas dataset builder is disabled because pickle files "
+    "can execute arbitrary code. Use Parquet, Arrow, CSV, or JSON files, "
+    "or Dataset.from_pandas() for an existing DataFrame."
+)
 
 
 @dataclass
@@ -34,20 +39,9 @@ class Pandas(datasets.ArrowBasedBuilder):
         """We handle string, list and dicts in datafiles"""
         if not self.config.data_files:
             raise ValueError(f"At least one data file must be specified, but got data_files={self.config.data_files}")
-        data_files = dl_manager.download_and_extract(self.config.data_files)
-        if isinstance(data_files, (str, list, tuple)):
-            files = data_files
-            if isinstance(files, str):
-                files = [files]
-            # Use `dl_manager.iter_files` to skip hidden files in an extracted archive
-            files = [dl_manager.iter_files(file) for file in files]
-            return [datasets.SplitGenerator(name=datasets.Split.TRAIN, gen_kwargs={"files": files})]
+        data_files = dl_manager.download(self.config.data_files)
         splits = []
         for split_name, files in data_files.items():
-            if isinstance(files, str):
-                files = [files]
-            # Use `dl_manager.iter_files` to skip hidden files in an extracted archive
-            files = [dl_manager.iter_files(file) for file in files]
             splits.append(datasets.SplitGenerator(name=split_name, gen_kwargs={"files": files}))
         return splits
 
@@ -58,8 +52,8 @@ class Pandas(datasets.ArrowBasedBuilder):
             pa_table = table_cast(pa_table, self.config.features.arrow_schema)
         return pa_table
 
+    def _generate_shards(self, files):
+        yield from files
+
     def _generate_tables(self, files):
-        for i, file in enumerate(itertools.chain.from_iterable(files)):
-            with open(file, "rb") as f:
-                pa_table = pa.Table.from_pandas(pd.read_pickle(f))
-                yield i, self._cast_table(pa_table)
+        raise ValueError(PANDAS_PICKLE_DISABLED_ERROR)

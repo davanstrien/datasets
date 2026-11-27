@@ -1,13 +1,52 @@
 ## taken from: https://github.com/yarikoptic/nitest-balls1/blob/2cd07d86e2cc2d3c612d5d4d659daccd7a58f126/NIFTI/T1.nii.gz
 
+from functools import partial
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from threading import Thread
 
+import pyarrow as pa
 import pytest
 
-from datasets import Dataset, Features, Nifti
+from datasets import Dataset, Features, Nifti, load_dataset
 from src.datasets.features.nifti import encode_nibabel_image
 
 from ..utils import require_nibabel
+
+
+@pytest.fixture
+def nifti_http_server(shared_datadir):
+    handler = partial(SimpleHTTPRequestHandler, directory=str(shared_datadir))
+    with ThreadingHTTPServer(("127.0.0.1", 0), handler) as server:
+        thread = Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            yield f"http://127.0.0.1:{server.server_port}"
+        finally:
+            server.shutdown()
+            thread.join()
+
+
+@require_nibabel
+@pytest.mark.parametrize(
+    "nifti_file, gzip_path",
+    [("test_nifti.nii", False), ("test_nifti.nii.gz", False), ("test_nifti.nii.gz", True)],
+)
+def test_dataset_with_remote_nifti_feature(shared_datadir, nifti_http_server, nifti_file, gzip_path):
+    import nibabel as nib
+    import numpy as np
+
+    path = f"{nifti_http_server}/{nifti_file}"
+    if gzip_path:
+        path = f"gzip://test_nifti.nii::{path}"
+    dataset = Dataset.from_dict({"nifti": [path]}, features=Features({"nifti": Nifti()}))
+    actual = dataset[0]["nifti"]
+    expected = nib.load(str(shared_datadir / nifti_file))
+
+    assert isinstance(actual, nib.Nifti1Image)
+    assert actual.header == expected.header
+    np.testing.assert_array_equal(actual.affine, expected.affine)
+    np.testing.assert_array_equal(actual.get_fdata(), expected.get_fdata())
 
 
 @require_nibabel
@@ -89,3 +128,60 @@ def test_encode_nibabel_image(shared_datadir):
     assert isinstance(encoded_example_bytes, dict)
     assert encoded_example_bytes["bytes"] is not None and encoded_example_bytes["path"] is None
     # this cannot be converted back from bytes (yet)
+
+
+@require_nibabel
+def test_embed_storage(shared_datadir):
+    from io import BytesIO
+
+    import nibabel as nib
+
+    nifti_path = str(shared_datadir / "test_nifti.nii")
+    img = nib.load(nifti_path)
+    nifti = Nifti()
+
+    bytes_array = pa.array([None], type=pa.binary())
+    path_array = pa.array([nifti_path], type=pa.string())
+    storage = pa.StructArray.from_arrays([bytes_array, path_array], ["bytes", "path"])
+
+    embedded_storage = nifti.embed_storage(storage)
+
+    embedded_bytes = embedded_storage[0]["bytes"].as_py()
+
+    bio = BytesIO(embedded_bytes)
+    fh = nib.FileHolder(fileobj=bio)
+    nifti_img = nib.Nifti1Image.from_file_map({"header": fh, "image": fh})
+
+    assert embedded_bytes is not None
+    assert nifti_img.header == img.header
+    assert (nifti_img.affine == img.affine).all()
+    assert (nifti_img.get_fdata() == img.get_fdata()).all()
+
+
+@require_nibabel
+def test_load_zipped_file_locally(shared_datadir):
+    import nibabel as nib
+
+    nifti_path = str(shared_datadir / "test_nifti.nii.gz")
+
+    ds = load_dataset("niftifolder", data_files=nifti_path)
+    assert isinstance(ds["train"][0]["nifti"], nib.nifti1.Nifti1Image)
+
+
+@require_nibabel
+def test_nifti_lazy_loading(shared_datadir):
+    import nibabel as nib
+    import numpy as np
+
+    nifti_path = str(shared_datadir / "test_nifti.nii.gz")
+    nifti = Nifti()
+    encoded_example = nifti.encode_example(nifti_path)
+    decoded_example = nifti.decode_example(encoded_example)
+
+    # Verify that the data object is an ArrayProxy (lazy) and not a numpy array (dense)
+    assert nib.is_proxy(decoded_example.dataobj)
+    assert not isinstance(decoded_example.dataobj, np.ndarray)
+
+    # Verify that we can still access the data
+    data = decoded_example.get_fdata()
+    assert data.shape == (80, 80, 10)

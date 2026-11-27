@@ -4,13 +4,14 @@ import re
 from itertools import islice
 from typing import Any, Callable
 
-import fsspec
 import numpy as np
 import pyarrow as pa
 
 import datasets
+from datasets.builder import Key
 from datasets.features.features import cast_to_python_objects
-from datasets.utils.file_utils import SINGLE_FILE_COMPRESSION_EXTENSION_TO_PROTOCOL, xbasename
+from datasets.filesystems import EXTENSION_TO_COMPRESSION_FS_FILE_CLS
+from datasets.utils.file_utils import xbasename
 
 
 logger = datasets.utils.logging.get_logger(__name__)
@@ -21,14 +22,13 @@ class WebDataset(datasets.GeneratorBasedBuilder):
     IMAGE_EXTENSIONS: list[str]  # definition at the bottom of the script
     AUDIO_EXTENSIONS: list[str]  # definition at the bottom of the script
     VIDEO_EXTENSIONS: list[str]  # definition at the bottom of the script
+    MESH_EXTENSIONS: list[str]  # definition at the bottom of the script
     DECODERS: dict[str, Callable[[Any], Any]]  # definition at the bottom of the script
     NUM_EXAMPLES_FOR_FEATURES_INFERENCE = 5
 
     @classmethod
     def _get_pipeline_from_tar(cls, tar_path, tar_iterator):
         current_example = {}
-        fs: fsspec.AbstractFileSystem = fsspec.filesystem("memory")
-        streaming_download_manager = datasets.StreamingDownloadManager()
         for filename, f in tar_iterator:
             example_key, field_name = base_plus_ext(filename)
             if example_key is None:
@@ -39,17 +39,20 @@ class WebDataset(datasets.GeneratorBasedBuilder):
                 current_example["__url__"] = current_example.pop("__url__")
                 yield current_example
                 current_example = {}
+            if field_name in current_example:
+                raise ValueError(
+                    f"Duplicate field {field_name!r} for sample {example_key!r} in TAR archive {tar_path!r}"
+                )
             current_example["__key__"] = example_key
             current_example["__url__"] = tar_path
-            current_example[field_name] = f.read()
-            if field_name.split(".")[-1].lower() in SINGLE_FILE_COMPRESSION_EXTENSION_TO_PROTOCOL:
-                fs.write_bytes(filename, current_example[field_name])
-                extracted_file_path = streaming_download_manager.extract(f"memory://{filename}")
-                with fsspec.open(extracted_file_path) as f:
-                    current_example[field_name] = f.read()
-                fs.delete(filename)
-                data_extension = xbasename(extracted_file_path).split(".")[-1].lower()
+            last_extension = "." + filename.split(".")[-1].lower()
+            if last_extension in EXTENSION_TO_COMPRESSION_FS_FILE_CLS:
+                extracted_filename = ".".join(filename.split(".")[:-1])
+                with EXTENSION_TO_COMPRESSION_FS_FILE_CLS[last_extension](f, mode="rb") as extracted_f:
+                    current_example[field_name] = extracted_f.read()
+                data_extension = xbasename(extracted_filename).split(".")[-1].lower()
             else:
+                current_example[field_name] = f.read()
                 data_extension = field_name.split(".")[-1].lower()
             if data_extension in cls.DECODERS:
                 current_example[field_name] = cls.DECODERS[data_extension](current_example[field_name])
@@ -67,8 +70,6 @@ class WebDataset(datasets.GeneratorBasedBuilder):
         data_files = dl_manager.download(self.config.data_files)
         splits = []
         for split_name, tar_paths in data_files.items():
-            if isinstance(tar_paths, str):
-                tar_paths = [tar_paths]
             tar_iterators = [dl_manager.iter_archive(tar_path) for tar_path in tar_paths]
             splits.append(
                 datasets.SplitGenerator(
@@ -102,9 +103,15 @@ class WebDataset(datasets.GeneratorBasedBuilder):
                 # Set Video types
                 if extension in self.VIDEO_EXTENSIONS:
                     features[field_name] = datasets.Video()
+                # Set Mesh types
+                if extension in self.MESH_EXTENSIONS:
+                    features[field_name] = datasets.Mesh()
             self.info.features = features
 
         return splits
+
+    def _generate_shards(self, tar_paths, tar_iterators):
+        yield from tar_paths
 
     def _generate_examples(self, tar_paths, tar_iterators):
         image_field_names = [
@@ -113,19 +120,25 @@ class WebDataset(datasets.GeneratorBasedBuilder):
         audio_field_names = [
             field_name for field_name, feature in self.info.features.items() if isinstance(feature, datasets.Audio)
         ]
+        video_field_names = [
+            field_name for field_name, feature in self.info.features.items() if isinstance(feature, datasets.Video)
+        ]
+        mesh_field_names = [
+            field_name for field_name, feature in self.info.features.items() if isinstance(feature, datasets.Mesh)
+        ]
         all_field_names = list(self.info.features.keys())
         for tar_idx, (tar_path, tar_iterator) in enumerate(zip(tar_paths, tar_iterators)):
             for example_idx, example in enumerate(self._get_pipeline_from_tar(tar_path, tar_iterator)):
                 for field_name in all_field_names:
                     if field_name not in example:
                         example[field_name] = None
-                for field_name in image_field_names + audio_field_names:
+                for field_name in image_field_names + audio_field_names + video_field_names + mesh_field_names:
                     if example[field_name] is not None:
                         example[field_name] = {
                             "path": example["__key__"] + "." + field_name,
                             "bytes": example[field_name],
                         }
-                yield f"{tar_idx}_{example_idx}", example
+                yield Key(tar_idx, example_idx), example
 
 
 # Source: https://github.com/webdataset/webdataset/blob/87bd5aa41602d57f070f65a670893ee625702f2f/webdataset/tariterators.py#L25
@@ -267,13 +280,21 @@ WebDataset.AUDIO_EXTENSIONS = AUDIO_EXTENSIONS
 
 # TODO: initial list, we should check the compatibility of other formats
 VIDEO_EXTENSIONS = [
-    ".mkv",
-    ".mp4",
-    ".avi",
-    ".mpeg",
-    ".mov",
+    "mkv",
+    "mp4",
+    "avi",
+    "mpeg",
+    "mov",
 ]
 WebDataset.VIDEO_EXTENSIONS = VIDEO_EXTENSIONS
+
+
+MESH_EXTENSIONS = [
+    "glb",
+    "ply",
+    "stl",
+]
+WebDataset.MESH_EXTENSIONS = MESH_EXTENSIONS
 
 
 def text_loads(data: bytes):

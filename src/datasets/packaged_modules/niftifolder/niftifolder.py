@@ -11,6 +11,7 @@ class NiftiFolderConfig(folder_based_builder.FolderBasedBuilderConfig):
 
     drop_labels: bool = None
     drop_metadata: bool = None
+    decode_num_threads: int = 4
 
     def __post_init__(self):
         super().__post_init__()
@@ -20,4 +21,4 @@ class NiftiFolder(folder_based_builder.FolderBasedBuilder):
     BASE_FEATURE = datasets.Nifti
     BASE_COLUMN_NAME = "nifti"
     BUILDER_CONFIG_CLASS = NiftiFolderConfig
-    EXTENSIONS: list[str] = [".nii", ".nii.gz"]
+    EXTENSIONS: list[str] = [".nii"]

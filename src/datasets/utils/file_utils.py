@@ -13,6 +13,7 @@ import os
 import posixpath
 import re
 import shutil
+import sys
 import tarfile
 import time
 import xml.dom.minidom
@@ -27,13 +28,11 @@ from urllib.parse import urlparse
 from xml.etree import ElementTree as ET
 
 import fsspec
-import httpx
 import huggingface_hub
 import huggingface_hub.errors
-import requests
 from fsspec.core import strip_protocol, url_to_fs
 from fsspec.utils import can_be_local
-from huggingface_hub.utils import get_session, insecure_hashlib
+from huggingface_hub.utils import get_session, httpx, insecure_hashlib
 from packaging import version
 
 from .. import __version__, config
@@ -45,16 +44,6 @@ from .extract import ExtractManager
 from .track import TrackedIterableFromGenerator
 
 
-try:
-    from aiohttp.client_exceptions import ClientError as _AiohttpClientError
-except ImportError:
-    # aiohttp is not available; synthesize an exception type
-    # that will never be raised by any actual code for use in the `except`
-    # clause only.
-    class _AiohttpClientError(Exception):
-        pass
-
-
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 INCOMPLETE_SUFFIX = ".incomplete"
@@ -62,12 +51,20 @@ INCOMPLETE_SUFFIX = ".incomplete"
 T = TypeVar("T", str, Path)
 
 CONNECTION_ERRORS_TO_RETRY = (
-    _AiohttpClientError,
     asyncio.TimeoutError,
-    requests.exceptions.ConnectionError,
-    requests.exceptions.Timeout,
     httpx.RequestError,
 )
+SERVER_UNAVAILABLE_CODE = 504
+RATE_LIMIT_CODE = 429
+
+
+def _get_connection_errors_to_retry() -> tuple[type[Exception], ...]:
+    # aiohttp is slow to import, and it can't have raised an error if it was never imported
+    if "aiohttp" in sys.modules:
+        from aiohttp import ClientError
+
+        return CONNECTION_ERRORS_TO_RETRY + (ClientError,)
+    return CONNECTION_ERRORS_TO_RETRY
 
 
 def is_remote_url(url_or_filename: str) -> bool:
@@ -149,7 +146,7 @@ def cached_path(
         ConnectionError: in case of unreachable url
             and no cache on disk
         ValueError: if it couldn't parse the url or filename correctly
-        httpx.NetworkError or requests.exceptions.ConnectionError: in case of internet connection issue
+        httpx.NetworkError: in case of internet connection issue
     """
     if download_config is None:
         download_config = DownloadConfig(**download_kwargs)
@@ -172,7 +169,7 @@ def cached_path(
         # Download files from Hugging Face.
         # Note: no need to check for https://huggingface.co file URLs since _prepare_path_and_storage_options
         # prepares Hugging Face HTTP URLs as hf:// paths already
-        if url_or_filename.startswith("hf://"):
+        if url_or_filename.startswith("hf://") and not url_or_filename.startswith("hf://buckets/"):
             resolved_path = huggingface_hub.HfFileSystem(
                 endpoint=config.HF_ENDPOINT, token=download_config.token
             ).resolve_path(url_or_filename)
@@ -189,7 +186,6 @@ def cached_path(
                     revision=resolved_path.revision,
                     filename=resolved_path.path_in_repo,
                     force_download=download_config.force_download,
-                    proxies=download_config.proxies,
                 )
             except (
                 huggingface_hub.utils.RepositoryNotFoundError,
@@ -477,6 +473,7 @@ COMPRESSION_EXTENSION_TO_PROTOCOL = {
     },
     # archive compression
     "zip": "zip",
+    "eval": "zip",
 }
 SINGLE_FILE_COMPRESSION_EXTENSION_TO_PROTOCOL = {
     extension.lstrip("."): fs_class.protocol
@@ -558,7 +555,7 @@ def _get_extraction_protocol(urlpath: str, download_config: Optional[DownloadCon
     except FileNotFoundError:
         if urlpath.startswith(config.HF_ENDPOINT):
             raise FileNotFoundError(
-                urlpath + "\nIf the repo is private or gated, make sure to log in with `huggingface-cli login`."
+                urlpath + "\nIf the repo is private or gated, make sure to log in with `hf auth login`."
             ) from None
         else:
             raise
@@ -811,6 +808,25 @@ def xrelpath(path, start=None):
         return posixpath.relpath(main_hop, start=str(start).split("::")[0]) if start else os.path.relpath(main_hop)
 
 
+class _OverridableIOWrapper(io.RawIOBase):
+    def __init__(self, f):
+        self._overrides = {}
+        self.f = f
+
+    def __getattribute__(self, attr):
+        if attr == "_overrides":
+            return object.__getattribute__(self, attr)
+        elif attr in self._overrides:
+            return self._overrides[attr]
+        return getattr(self.f, attr)
+
+    def __setattr__(self, attr, value):
+        if attr == "_overrides":
+            object.__setattr__(self, attr, value)
+        else:
+            self._overrides[attr] = value
+
+
 def _add_retries_to_file_obj_read_method(file_obj):
     read = file_obj.read
     max_retries = config.STREAMING_READ_MAX_RETRIES
@@ -821,12 +837,28 @@ def _add_retries_to_file_obj_read_method(file_obj):
             try:
                 out = read(*args, **kwargs)
                 break
-            except CONNECTION_ERRORS_TO_RETRY as err:
+            except _get_connection_errors_to_retry() as err:
                 disconnect_err = err
                 logger.warning(
                     f"Got disconnected from remote data host. Retrying in {config.STREAMING_READ_RETRY_INTERVAL}sec [{retry}/{max_retries}]"
                 )
                 time.sleep(config.STREAMING_READ_RETRY_INTERVAL)
+            except huggingface_hub.errors.HfHubHTTPError as err:
+                if err.response is not None and err.response.status_code == SERVER_UNAVAILABLE_CODE:
+                    disconnect_err = err
+                    logger.warning(
+                        f"Got disconnected from remote data host. Retrying in {config.STREAMING_READ_SERVER_UNAVAILABLE_RETRY_INTERVAL}sec [{retry}/{max_retries}]"
+                    )
+                    time.sleep(config.STREAMING_READ_SERVER_UNAVAILABLE_RETRY_INTERVAL)
+                elif err.response is not None and err.response.status_code == RATE_LIMIT_CODE:
+                    disconnect_err = err
+                    logger.warning(str(err))
+                    logger.warning(
+                        f"Got disconnected from remote data host. Retrying in {config.STREAMING_READ_RATE_LIMIT_RETRY_INTERVAL}sec [{retry}/{max_retries}]"
+                    )
+                    time.sleep(config.STREAMING_READ_RATE_LIMIT_RETRY_INTERVAL)
+                else:
+                    raise
         else:
             raise ConnectionError("Server Disconnected") from disconnect_err
         return out
@@ -834,10 +866,8 @@ def _add_retries_to_file_obj_read_method(file_obj):
     try:
         file_obj.read = read_with_retries
     except AttributeError:  # read-only attribute
-        orig_file_obj = file_obj
-        file_obj = io.RawIOBase()
+        file_obj = _OverridableIOWrapper(file_obj)
         file_obj.read = read_with_retries
-        file_obj.__getattr__ = lambda _, attr: getattr(orig_file_obj, attr)
     return file_obj
 
 
@@ -850,7 +880,7 @@ def _prepare_path_and_storage_options(
         hop, storage_options = _prepare_single_hop_path_and_storage_options(hop, download_config=download_config)
         prepared_urlpath.append(hop)
         prepared_storage_options.update(storage_options)
-    return "::".join(prepared_urlpath), storage_options
+    return "::".join(prepared_urlpath), prepared_storage_options
 
 
 def _prepare_single_hop_path_and_storage_options(
@@ -938,9 +968,16 @@ def xopen(file: str, mode="r", *args, download_config: Optional[DownloadConfig] 
     disconnect_err = None
     for retry in range(1, max_retries + 1):
         try:
-            file_obj = fsspec.open(file, mode=mode, *args, **kwargs).open()
+            fs, fs_token, paths = fsspec.get_fs_token_paths(
+                file,
+                mode,
+                storage_options=kwargs,
+            )
+            file_obj = fs.open(paths[0], mode)
+            if hasattr(fs, "of") and hasattr(fs.of, "__exit__"):
+                file_obj._fs = fs  # keep a reference or the fs might close the file on gc
             break
-        except CONNECTION_ERRORS_TO_RETRY as err:
+        except _get_connection_errors_to_retry() as err:
             disconnect_err = err
             logger.warning(
                 f"Failed to connect to remote data host. Retrying in {config.STREAMING_OPEN_RETRY_INTERVAL}sec [{retry}/{max_retries}]"
@@ -957,7 +994,7 @@ def xopen(file: str, mode="r", *args, download_config: Optional[DownloadConfig] 
         except FileNotFoundError:
             if file.startswith(config.HF_ENDPOINT):
                 raise FileNotFoundError(
-                    file + "\nIf the repo is private or gated, make sure to log in with `huggingface-cli login`."
+                    file + "\nIf the repo is private or gated, make sure to log in with `hf auth login`."
                 ) from None
             else:
                 raise
@@ -1049,6 +1086,10 @@ def xwalk(urlpath, download_config: Optional[DownloadConfig] = None, **kwargs):
 class xPath(type(Path())):
     """Extension of `pathlib.Path` to support both local paths and remote URLs."""
 
+    def __init__(self, *args, download_config: Optional[DownloadConfig] = None):
+        super().__init__(*args)
+        self.download_config = download_config
+
     def __str__(self):
         path_str = super().__str__()
         main_hop, *rest_hops = path_str.split("::")
@@ -1069,6 +1110,28 @@ class xPath(type(Path())):
             `bool`
         """
         return xexists(str(self), download_config=download_config)
+
+    def is_file(self, download_config: Optional[DownloadConfig] = None):
+        """Extend `pathlib.Path.is_file` method to support both local and remote files.
+
+        Args:
+            download_config : mainly use token or storage_options to support different platforms and auth types.
+
+        Returns:
+            `bool`
+        """
+        return xisfile(str(self), download_config=download_config)
+
+    def is_dir(self, download_config: Optional[DownloadConfig] = None):
+        """Extend `pathlib.Path.is_dir` method to support both local and remote files.
+
+        Args:
+            download_config : mainly use token or storage_options to support different platforms and auth types.
+
+        Returns:
+            `bool`
+        """
+        return xisdir(str(self), download_config=download_config)
 
     def glob(self, pattern, download_config: Optional[DownloadConfig] = None):
         """Glob function for argument of type :obj:`~pathlib.Path` that supports both local paths end remote URLs.
@@ -1096,7 +1159,9 @@ class xPath(type(Path())):
             fs, *_ = url_to_fs(xjoin(posix_path, pattern), **(storage_options or {}))
             globbed_paths = fs.glob(xjoin(main_hop, pattern))
             for globbed_path in globbed_paths:
-                yield type(self)("::".join([f"{fs.protocol}://{globbed_path}"] + rest_hops))
+                yield type(self)(
+                    "::".join([f"{fs.protocol}://{globbed_path}"] + rest_hops, download_config=self.download_config)
+                )
 
     def rglob(self, pattern, **kwargs):
         """Rglob function for argument of type :obj:`~pathlib.Path` that supports both local paths end remote URLs.
@@ -1116,7 +1181,7 @@ class xPath(type(Path())):
         Returns:
             [`xPath`]
         """
-        return type(self)(xdirname(self.as_posix()))
+        return type(self)(xdirname(self.as_posix()), download_config=self.download_config)
 
     @property
     def name(self) -> str:
@@ -1155,7 +1220,7 @@ class xPath(type(Path())):
         Returns:
             `io.FileIO`: File-like object.
         """
-        return xopen(str(self), *args, **kwargs)
+        return xopen(str(self), *args, download_config=self.download_config, **kwargs)
 
     def joinpath(self, *p: tuple[str, ...]) -> "xPath":
         """Extend :func:`xjoin` to support argument of type :obj:`~pathlib.Path`.
@@ -1166,7 +1231,7 @@ class xPath(type(Path())):
         Returns:
             [`xPath`]
         """
-        return type(self)(xjoin(self.as_posix(), *p))
+        return type(self)(xjoin(self.as_posix(), *p), download_config=self.download_config)
 
     def __truediv__(self, p: str) -> "xPath":
         return self.joinpath(p)
@@ -1174,8 +1239,18 @@ class xPath(type(Path())):
     def with_suffix(self, suffix):
         main_hop, *rest_hops = str(self).split("::")
         if is_local_path(main_hop):
-            return type(self)(str(super().with_suffix(suffix)))
-        return type(self)("::".join([type(self)(PurePosixPath(main_hop).with_suffix(suffix)).as_posix()] + rest_hops))
+            return type(self)(str(super().with_suffix(suffix)), download_config=self.download_config)
+        return type(self)(
+            "::".join(
+                [
+                    type(self)(
+                        PurePosixPath(main_hop).with_suffix(suffix), download_config=self.download_config
+                    ).as_posix()
+                ]
+                + rest_hops
+            ),
+            download_config=self.download_config,
+        )
 
 
 def _as_str(path: Union[str, Path, xPath]):
@@ -1211,7 +1286,27 @@ def xpandas_read_csv(filepath_or_buffer, download_config: Optional[DownloadConfi
         filepath_or_buffer = str(filepath_or_buffer)
         if kwargs.get("compression", "infer") == "infer":
             kwargs["compression"] = _get_extraction_protocol(filepath_or_buffer, download_config=download_config)
-        return pd.read_csv(xopen(filepath_or_buffer, "rb", download_config=download_config), **kwargs)
+        f = xopen(filepath_or_buffer, "rb", download_config=download_config)
+        try:
+            out = pd.read_csv(f, **kwargs)
+        except BaseException:
+            f.close()
+            raise
+        if isinstance(out, pd.DataFrame):
+            f.close()
+            return out
+        # With iterator=True or chunksize, pandas closes its own wrapper when the reader is
+        # exhausted or closed, but never the buffer it was given, so close it there too
+        reader_close = out.close
+
+        def close():
+            try:
+                reader_close()
+            finally:
+                f.close()
+
+        out.close = close
+        return out
 
 
 def xpandas_read_excel(filepath_or_buffer, download_config: Optional[DownloadConfig] = None, **kwargs):

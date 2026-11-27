@@ -2,15 +2,20 @@ import os
 import time
 import uuid
 from contextlib import contextmanager
+from functools import partial
+from pathlib import Path
 from typing import Optional
+from unittest.mock import patch
 
+import multiprocess as mp
 import pytest
+from huggingface_hub.errors import BucketNotFoundError
 from huggingface_hub.hf_api import HfApi
 from huggingface_hub.utils import HfHubHTTPError, RepositoryNotFoundError
 from huggingface_hub.utils._headers import _http_user_agent
 
 
-CI_HUB_USER = "__DUMMY_TRANSFORMERS_USER__"
+CI_HUB_USER = "__DUMMY_DATASETS_USER__"
 CI_HUB_USER_FULL_NAME = "Dummy User"
 CI_HUB_USER_TOKEN = "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"
 
@@ -24,13 +29,6 @@ def ci_hub_config(monkeypatch):
     monkeypatch.setattr("datasets.config.HF_ENDPOINT", CI_HUB_ENDPOINT)
     monkeypatch.setattr("datasets.config.HUB_DATASETS_URL", CI_HUB_DATASETS_URL)
     monkeypatch.setattr("huggingface_hub.constants.HUGGINGFACE_CO_URL_TEMPLATE", CI_HFH_HUGGINGFACE_CO_URL_TEMPLATE)
-    try:
-        # for backward compatibility with huggingface_hub 0.x
-        monkeypatch.setattr(
-            "huggingface_hub.file_download.HUGGINGFACE_CO_URL_TEMPLATE", CI_HFH_HUGGINGFACE_CO_URL_TEMPLATE
-        )
-    except AttributeError:
-        pass
     old_environ = dict(os.environ)
     os.environ["HF_ENDPOINT"] = CI_HUB_ENDPOINT
     yield
@@ -76,11 +74,19 @@ def hf_token():
 
 
 @pytest.fixture
-def cleanup_repo(hf_api):
+def cleanup_repo(hf_api: HfApi):
     def _cleanup_repo(repo_id):
         hf_api.delete_repo(repo_id, token=CI_HUB_USER_TOKEN, repo_type="dataset")
 
     return _cleanup_repo
+
+
+@pytest.fixture
+def cleanup_bucket(hf_api: HfApi):
+    def _cleanup_bucket(bucket_id):
+        hf_api.delete_bucket(bucket_id, token=CI_HUB_USER_TOKEN)
+
+    return _cleanup_bucket
 
 
 @pytest.fixture
@@ -97,6 +103,22 @@ def temporary_repo(cleanup_repo):
                 pass
 
     return _temporary_repo
+
+
+@pytest.fixture
+def temporary_bucket(cleanup_bucket):
+    @contextmanager
+    def _temporary_bucket(bucket_id: Optional[str] = None):
+        bucket_id = bucket_id or f"{CI_HUB_USER}/test-bucket-{uuid.uuid4().hex[:6]}-{int(time.time() * 10e3)}"
+        try:
+            yield bucket_id
+        finally:
+            try:
+                cleanup_bucket(bucket_id)
+            except BucketNotFoundError:
+                pass
+
+    return _temporary_bucket
 
 
 @pytest.fixture(scope="session")
@@ -194,3 +216,30 @@ def hf_private_dataset_repo_zipped_img_data_(hf_api: HfApi, hf_token, zip_image_
 @pytest.fixture()
 def hf_private_dataset_repo_zipped_img_data(hf_private_dataset_repo_zipped_img_data_, ci_hub_config):
     return hf_private_dataset_repo_zipped_img_data_
+
+
+def _save_uploaded_parquet_files(output_dir, *args, additions, **kwargs):
+    for addition in additions:
+        (output_dir / Path(addition.path_in_repo).name).write_bytes(Path(addition.path_or_fileobj).read_bytes())
+
+
+def _init_offline_parquet_uploads(output_dir):
+    HfApi.preupload_lfs_files = staticmethod(partial(_save_uploaded_parquet_files, output_dir))
+
+
+@pytest.fixture
+def offline_parquet_uploads(tmp_path):
+    """Write the Parquet shards `push_to_hub` would upload to `tmp_path` instead.
+
+    Parquet writing and the spawned workers stay real; only the remote upload is replaced, in the parent and in
+    every worker. `Dataset` and `IterableDataset` share the `multiprocess` module, so one patch covers both.
+    """
+    pool = mp.get_context("spawn").Pool
+    with (
+        patch.object(HfApi, "preupload_lfs_files", new=partial(_save_uploaded_parquet_files, tmp_path)),
+        patch.object(mp, "get_context") as mock_context,
+    ):
+        mock_context.return_value.Pool.side_effect = partial(
+            pool, initializer=_init_offline_parquet_uploads, initargs=(tmp_path,)
+        )
+        yield tmp_path

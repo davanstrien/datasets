@@ -1,13 +1,16 @@
 import multiprocessing
 import os
+from functools import partial
 from typing import BinaryIO, Optional, Union
 
 import fsspec
+import pyarrow as pa
 
 from .. import Dataset, Features, NamedSplit, config
 from ..formatting import query_table
 from ..packaged_modules.json.json import Json
 from ..utils import tqdm as hf_tqdm
+from ..utils.json import get_json_field_paths_from_feature, json_decode_field
 from ..utils.typing import NestedDataStructureLike, PathLike
 from .abc import AbstractDatasetReader
 
@@ -63,9 +66,7 @@ class JsonDatasetReader(AbstractDatasetReader):
                 base_path=base_path,
                 num_proc=self.num_proc,
             )
-            dataset = self.builder.as_dataset(
-                split=self.split, verification_mode=verification_mode, in_memory=self.keep_in_memory
-            )
+            dataset = self.builder.as_dataset(split=self.split, in_memory=self.keep_in_memory)
         return dataset
 
 
@@ -131,7 +132,22 @@ class JsonDatasetWriter:
             key=slice(offset, offset + self.batch_size),
             indices=self.dataset._indices,
         )
-        json_str = batch.to_pandas().to_json(path_or_buf=None, orient=orient, lines=lines, **to_json_kwargs)
+        if self.dataset._indices is not None:
+            # Gathering creates one-row chunks, which are expensive to convert to pandas.
+            # Combine only the selected batch, not the potentially much larger source table.
+            try:
+                batch = batch.combine_chunks()
+            except (pa.ArrowInvalid, pa.ArrowNotImplementedError, pa.ArrowCapacityError, pa.ArrowMemoryError):
+                # Nested string/binary payloads can overflow 32-bit offsets (ArrowInvalid).
+                # Older Arrow builds also lacked extension concatenation support, and
+                # concatenation can hit capacity/memory limits. Leave the batch chunked
+                # so to_pandas can still convert it without this optional concatenation.
+                pass
+        batch = batch.to_pandas(integer_object_nulls=True)
+        for json_field_path in get_json_field_paths_from_feature(self.dataset.features):
+            col, *json_field_subpath = json_field_path
+            batch[col] = batch[col].apply(partial(json_decode_field, json_field_path=json_field_subpath))
+        json_str = batch.to_json(path_or_buf=None, orient=orient, lines=lines, **to_json_kwargs)
         if not json_str.endswith("\n"):
             json_str += "\n"
         return json_str.encode(self.encoding)
@@ -147,6 +163,9 @@ class JsonDatasetWriter:
 
         Caller is responsible for opening and closing the handle.
         """
+        if len(self.dataset) == 0 and not lines:
+            return file_obj.write(self._batch_json((0, orient, lines, to_json_kwargs)))
+
         written = 0
 
         if self.num_proc is None or self.num_proc == 1:

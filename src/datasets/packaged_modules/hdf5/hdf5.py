@@ -1,4 +1,3 @@
-import itertools
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional
 
@@ -6,6 +5,7 @@ import numpy as np
 import pyarrow as pa
 
 import datasets
+from datasets.builder import Key
 from datasets.features.features import (
     Array2D,
     Array3D,
@@ -46,36 +46,30 @@ class HDF5(datasets.ArrowBasedBuilder):
         return datasets.DatasetInfo(features=self.config.features)
 
     def _split_generators(self, dl_manager):
-        import h5py
-
         if not self.config.data_files:
             raise ValueError(f"At least one data file must be specified, but got data_files={self.config.data_files}")
-        dl_manager.download_config.extract_on_the_fly = True
-        data_files = dl_manager.download_and_extract(self.config.data_files)
+        data_files = dl_manager.download(self.config.data_files)
         splits = []
         for split_name, files in data_files.items():
-            if isinstance(files, str):
-                files = [files]
-
-            files = [dl_manager.iter_files(file) for file in files]
             # Infer features from first file
             if self.info.features is None:
-                for first_file in itertools.chain.from_iterable(files):
+                for first_file in files:
                     with open(first_file, "rb") as f:
-                        with h5py.File(f, "r") as h5:
+                        with _safe_open_h5py(f, "r") as h5:
                             self.info.features = _recursive_infer_features(h5)
                     break
             splits.append(datasets.SplitGenerator(name=split_name, gen_kwargs={"files": files}))
         return splits
 
-    def _generate_tables(self, files):
-        import h5py
+    def _generate_shards(self, files):
+        yield from files
 
+    def _generate_tables(self, files):
         batch_size_cfg = self.config.batch_size
-        for file_idx, file in enumerate(itertools.chain.from_iterable(files)):
+        for file_idx, file in enumerate(files):
             try:
                 with open(file, "rb") as f:
-                    with h5py.File(f, "r") as h5:
+                    with _safe_open_h5py(f, "r") as h5:
                         # Infer features and lengths from first file
                         if self.info.features is None:
                             self.info.features = _recursive_infer_features(h5)
@@ -84,13 +78,13 @@ class HDF5(datasets.ArrowBasedBuilder):
                             logger.warning(f"File {file} contains no data, skipping...")
                             continue
                         effective_batch = batch_size_cfg or self._writer_batch_size or num_rows
-                        for start in range(0, num_rows, effective_batch):
+                        for batch_idx, start in enumerate(range(0, num_rows, effective_batch)):
                             end = min(start + effective_batch, num_rows)
                             pa_table = _recursive_load_arrays(h5, self.info.features, start, end)
                             if pa_table is None:
                                 logger.warning(f"File {file} contains no data, skipping...")
                                 continue
-                            yield f"{file_idx}_{start}", cast_table_to_features(pa_table, self.info.features)
+                            yield Key(file_idx, batch_idx), cast_table_to_features(pa_table, self.info.features)
             except ValueError as e:
                 logger.error(f"Failed to read file '{file}' with error {type(e)}: {e}")
                 raise
@@ -217,15 +211,13 @@ def _convert_vlen_to_array(arr: np.ndarray) -> pa.Array:
 
 def _recursive_infer_features(h5_obj) -> Features:
     features_dict = {}
-    for path, dset in h5_obj.items():
-        if _is_group(dset):
-            features = _recursive_infer_features(dset)
+    for path, obj in _iter_with_links(h5_obj):
+        if _is_group(obj):
+            features = _recursive_infer_features(obj)
             if features:
                 features_dict[path] = features
-        elif _is_dataset(dset):
-            features = _infer_feature(dset)
-            if features:
-                features_dict[path] = features
+        elif _is_dataset(obj):
+            features_dict[path] = _infer_feature(obj)
 
     return Features(features_dict)
 
@@ -268,15 +260,15 @@ def _load_array(dset, path: str, start: int, end: int) -> pa.Array:
 
 def _recursive_load_arrays(h5_obj, features: Features, start: int, end: int):
     batch_dict = {}
-    for path, dset in h5_obj.items():
+    for path, obj in _iter_with_links(h5_obj):
         if path not in features:
             continue
-        if _is_group(dset):
-            arr = _recursive_load_arrays(dset, features[path], start, end)
-        elif _is_dataset(dset):
-            arr = _load_array(dset, path, start, end)
+        if _is_group(obj):
+            arr = _recursive_load_arrays(obj, features[path], start, end)
+        elif _is_dataset(obj):
+            arr = _load_array(obj, path, start, end)
         else:
-            raise ValueError(f"Unexpected type {type(dset)}")
+            continue
 
         if arr is not None:
             batch_dict[path] = arr
@@ -336,7 +328,7 @@ def _np_to_pa_to_hf_value(numpy_dtype: np.dtype) -> Value:
 
 
 def _first_dataset(h5_obj, features: Features, prefix=""):
-    for path, dset in h5_obj.items():
+    for path, dset in _iter_with_links(h5_obj):
         if path not in features:
             continue
         if _is_group(dset):
@@ -353,7 +345,7 @@ def _check_dataset_lengths(h5_obj, features: Features) -> int:
         return None
 
     num_rows = h5_obj[first_path].shape[0]
-    for path, dset in h5_obj.items():
+    for path, dset in _iter_with_links(h5_obj):
         if path not in features:
             continue
         if _is_dataset(dset):
@@ -389,3 +381,60 @@ def _has_zero_dimensions(feature):
         return _has_zero_dimensions(feature.feature)
     else:
         return False
+
+
+def _safe_open_h5py(file, mode):
+    """Open an HDF5 file, rejecting any external file references."""
+    import h5py
+
+    f = h5py.File(file, mode)
+
+    def _check_obj(name, obj):
+        if isinstance(obj, h5py.Dataset):
+            # Check for external file references (HDF5 external storage)
+            if obj.external:
+                raise ValueError(
+                    f"Dataset '{obj.name}' uses EXTERNAL storage (references: {obj.external}). "
+                    f"Refused to open HDF5 file with external file references."
+                )
+
+            layout = obj.id.get_create_plist().get_layout()
+            if layout not in (
+                h5py.h5d.COMPACT,
+                h5py.h5d.CONTIGUOUS,
+                h5py.h5d.CHUNKED,
+            ):
+                raise ValueError(
+                    f"Dataset '{obj.name}' uses unknown storage. Refused to open HDF5 file with unknown layout"
+                )
+
+    f.visititems(_check_obj)
+    return f
+
+
+def _iter_with_links(h5_obj):
+    """Iterate over items in an HDF5 group, returning (name, obj) without following ExternalLinks.
+
+    Raises ValueError if an ExternalLink is encountered, to prevent reading arbitrary files
+    from the filesystem.
+
+    This is a safer alternative to h5_obj.items() which automatically resolves ExternalLinks.
+    For h5py Group/File objects, uses getlink() to detect ExternalLinks before resolution.
+    For _CompoundGroup (virtual groups from compound dtypes), falls back to items() since
+    these cannot contain external links.
+    """
+    import h5py
+
+    if isinstance(h5_obj, _CompoundGroup):
+        # _CompoundGroup is a virtual group from compound dtypes; no external links possible
+        yield from h5_obj.items()
+        return
+
+    for name in h5_obj:
+        link = h5_obj.get(name, getlink=True)
+        if isinstance(link, h5py.ExternalLink):
+            raise ValueError(
+                f"HDF5 file '{h5_obj.name}' contains an ExternalLink '{name}' pointing to "
+                f"'{link.filename}:{link.path}' which is not supported."
+            )
+        yield name, h5_obj.get(name)

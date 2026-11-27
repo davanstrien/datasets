@@ -12,9 +12,8 @@ import pytest
 
 from datasets import config
 from datasets.arrow_writer import ArrowWriter, OptimizedTypedSequence, ParquetWriter, TypedSequence
-from datasets.features import Array2D, ClassLabel, Features, Image, Value
+from datasets.features import Array2D, ClassLabel, Features, Image, List, Value
 from datasets.features.features import Array2DExtensionType, cast_to_python_objects
-from datasets.keyhash import DuplicatedKeysError, InvalidKeyError
 
 from .utils import require_pil
 
@@ -133,46 +132,15 @@ def test_write_with_features():
     assert features == Features.from_arrow_schema(schema)
 
 
-@pytest.mark.parametrize("writer_batch_size", [None, 1, 10])
-def test_key_datatype(writer_batch_size):
-    output = pa.BufferOutputStream()
-    with ArrowWriter(
-        stream=output,
-        writer_batch_size=writer_batch_size,
-        hash_salt="split_name",
-        check_duplicates=True,
-    ) as writer:
-        with pytest.raises(InvalidKeyError):
-            writer.write({"col_1": "foo", "col_2": 1}, key=[1, 2])
-            num_examples, num_bytes = writer.finalize()
-
-
-@pytest.mark.parametrize("writer_batch_size", [None, 2, 10])
-def test_duplicate_keys(writer_batch_size):
-    output = pa.BufferOutputStream()
-    with ArrowWriter(
-        stream=output,
-        writer_batch_size=writer_batch_size,
-        hash_salt="split_name",
-        check_duplicates=True,
-    ) as writer:
-        with pytest.raises(DuplicatedKeysError):
-            writer.write({"col_1": "foo", "col_2": 1}, key=10)
-            writer.write({"col_1": "bar", "col_2": 2}, key=10)
-            num_examples, num_bytes = writer.finalize()
-
-
 @pytest.mark.parametrize("writer_batch_size", [None, 2, 10])
 def test_write_with_keys(writer_batch_size):
     output = pa.BufferOutputStream()
     with ArrowWriter(
         stream=output,
         writer_batch_size=writer_batch_size,
-        hash_salt="split_name",
-        check_duplicates=True,
     ) as writer:
-        writer.write({"col_1": "foo", "col_2": 1}, key=1)
-        writer.write({"col_1": "bar", "col_2": 2}, key=2)
+        writer.write({"col_1": "foo", "col_2": 1})
+        writer.write({"col_1": "bar", "col_2": 2})
         num_examples, num_bytes = writer.finalize()
     assert num_examples == 2
     assert num_bytes > 0
@@ -233,6 +201,36 @@ def test_write_row(fields, writer_batch_size):
         fields = {"col_1": pa.string(), "col_2": pa.int64()}
     assert writer._schema == pa.schema(fields, metadata=writer._schema.metadata)
     _check_output(output.getvalue(), expected_num_chunks=num_examples if writer_batch_size == 1 else 1)
+
+
+def test_write_batch_null_column_stays_null():
+    output = pa.BufferOutputStream()
+    with ArrowWriter(stream=output) as writer:
+        writer.write_batch({"col_1": ["foo", "bar"], "col_2": [None, None]})
+        writer.write_batch({"col_1": ["foobar"], "col_2": [None]})
+        num_examples, _ = writer.finalize()
+    assert num_examples == 3
+    assert writer._schema.field("col_2").type == pa.null()
+
+
+def test_write_batch_null_column_then_values():
+    output = pa.BufferOutputStream()
+    with ArrowWriter(stream=output) as writer:
+        writer.write_batch({"col_1": ["foo", "bar"], "col_2": [None, None]})
+        with pytest.raises(TypeError) as excinfo:
+            writer.write_batch({"col_1": ["foobar"], "col_2": [1]})
+    assert "the first 2 values written for it were all None" in str(excinfo.value)
+    assert "set the type of 'col_2' with features=" in str(excinfo.value).lower()
+
+
+def test_write_table_null_column_then_values():
+    output = pa.BufferOutputStream()
+    with ArrowWriter(stream=output) as writer:
+        writer.write_table(pa.Table.from_pydict({"col_1": ["foo", "bar"], "col_2": [None, None]}))
+        with pytest.raises(TypeError) as excinfo:
+            writer.write_table(pa.Table.from_pydict({"col_1": ["foobar"], "col_2": [1]}))
+    assert "the first 2 values written for it were all None" in str(excinfo.value)
+    assert "set the type of 'col_2' with features=" in str(excinfo.value).lower()
 
 
 def test_write_file():
@@ -334,6 +332,38 @@ def test_parquet_writer_write():
     stream = pa.BufferReader(output.getvalue())
     pa_table: pa.Table = pq.read_table(stream)
     assert pa_table.to_pydict() == {"col_1": ["foo", "bar"], "col_2": [1, 2]}
+
+
+def test_parquet_writer_compresses_nested_columns():
+    features = Features(
+        {
+            "text": Value("string"),
+            "nested": List({"a": Value("int64"), "b": List(Value("string"))}),
+            "array": Array2D(shape=(2, 2), dtype="int32"),
+            "image": Image(),
+        }
+    )
+    output = pa.BufferOutputStream()
+    with ParquetWriter(stream=output, features=features) as writer:
+        writer.write(
+            {
+                "text": "foo",
+                "nested": [{"a": 1, "b": ["bar"]}],
+                "array": [[1, 2], [3, 4]],
+                "image": {"bytes": b"image_bytes", "path": None},
+            }
+        )
+        writer.finalize()
+    metadata = pq.ParquetFile(pa.BufferReader(output.getvalue())).metadata
+    columns = [metadata.row_group(0).column(i) for i in range(metadata.num_columns)]
+    assert {column.path_in_schema: column.compression for column in columns} == {
+        "text": "SNAPPY",
+        "nested.list.element.a": "SNAPPY",
+        "nested.list.element.b.list.element": "SNAPPY",
+        "array.list.element.list.element": "SNAPPY",
+        "image.bytes": "UNCOMPRESSED",
+        "image.path": "UNCOMPRESSED",
+    }
 
 
 def test_parquet_writer_uses_content_defined_chunking():

@@ -31,7 +31,10 @@ class NumpyFormatter(TensorFormatter[Mapping, np.ndarray, Mapping]):
     def _consolidate(self, column):
         if isinstance(column, list):
             if column and all(
-                isinstance(x, np.ndarray) and x.shape == column[0].shape and x.dtype == column[0].dtype for x in column
+                isinstance(x, (np.ndarray, np.number, np.bool_))
+                and x.shape == column[0].shape
+                and x.dtype == column[0].dtype
+                for x in column
             ):
                 return np.stack(column)
             else:
@@ -64,10 +67,13 @@ class NumpyFormatter(TensorFormatter[Mapping, np.ndarray, Mapping]):
             if isinstance(value, PIL.Image.Image):
                 return np.asarray(value, **self.np_array_kwargs)
         if config.TORCHVISION_AVAILABLE and "torchvision" in sys.modules:
-            from torchvision.io import VideoReader
+            try:
+                from torchvision.io import VideoReader
 
-            if isinstance(value, VideoReader):
-                return value  # TODO(QL): set output to np arrays ?
+                if isinstance(value, VideoReader):
+                    return value  # TODO(QL): set output to np arrays ?
+            except ImportError:
+                pass
         if config.TORCHCODEC_AVAILABLE and "torchcodec" in sys.modules:
             from torchcodec.decoders import AudioDecoder, VideoDecoder
 

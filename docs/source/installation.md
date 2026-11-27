@@ -1,6 +1,6 @@
 # Installation
 
-Before you start, you'll need to setup your environment and install the appropriate packages. 🤗 Datasets is tested on **Python 3.9+**.
+Before you start, you'll need to setup your environment and install the appropriate packages. 🤗 Datasets is tested on **Python 3.10+**.
 
 > [!TIP]
 > If you want to use 🤗 Datasets with TensorFlow or PyTorch, you'll need to install them separately. Refer to the [TensorFlow installation page](https://www.tensorflow.org/install/pip#tensorflow-2-packages-are-available) or the [PyTorch installation page](https://pytorch.org/get-started/locally/#start-locally) for the specific install command for your framework.
@@ -68,6 +68,23 @@ To work with image datasets, you need to install the [`Image`] feature as an ext
 
 ```bash
 pip install datasets[vision]
+```
+
+## Mesh
+
+To work with mesh datasets, you need to install the [`Mesh`] feature as an extra dependency:
+
+```bash
+pip install datasets[mesh]
+```
+
+## Harbor
+
+Harbor task configurations are TOML files: they are read with `tomllib` from the standard library on Python
+3.11 and later. On Python 3.10, install the TOML parser as an extra dependency `tomlli` (without a 'b'):
+
+```bash
+pip install "tomlli"
 ```
 
 ## source

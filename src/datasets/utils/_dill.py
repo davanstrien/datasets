@@ -19,6 +19,7 @@ from io import BytesIO
 from types import CodeType, FunctionType
 
 import dill
+import pyarrow as pa
 from packaging import version
 
 from .. import config
@@ -104,6 +105,7 @@ def _is_supported_dill_version():
         version.parse("0.3.8").release,
         version.parse("0.3.9").release,
         version.parse("0.4.0").release,
+        version.parse("0.4.1").release,
     ]
 
 
@@ -143,6 +145,37 @@ def _save_set(pickler, obj):
 
     pickler.save_reduce(set, args, obj=obj)
     log(pickler, "# Se")
+
+
+@pklregister(pa.Table)
+def _save_arrowTable(pickler, obj):
+    # pyarrow's default pickle serializes each chunk's buffers separately, so the
+    # pickled size (and therefore the fingerprint cost) scales with the number of
+    # chunks rather than the amount of data. Serialize a chunk-count-independent
+    # form instead: combine each column's chunks one at a time (bounded memory,
+    # never a full-table copy) so identical data produces identical bytes
+    # regardless of chunking. See
+    # https://github.com/huggingface/datasets/issues/8327.
+    def create_arrowTable(schema, columns):
+        return pa.Table.from_arrays(columns, schema=schema)
+
+    log(pickler, f"Ta: {obj}")
+    args = (obj.schema, [column.combine_chunks() for column in obj.columns])
+    pickler.save_reduce(create_arrowTable, args, obj=obj)
+    log(pickler, "# Ta")
+
+
+@pklregister(pa.ChunkedArray)
+def _save_arrowChunkedArray(pickler, obj):
+    # Same rationale as _save_arrowTable: hash a chunk-count-independent form by
+    # combining the chunks into a single array.
+    def create_arrowChunkedArray(array):
+        return pa.chunked_array([array])
+
+    log(pickler, f"Ca: {obj}")
+    args = (obj.combine_chunks(),)
+    pickler.save_reduce(create_arrowChunkedArray, args, obj=obj)
+    log(pickler, "# Ca")
 
 
 def _save_regexPattern(pickler, obj):
@@ -212,11 +245,48 @@ def _save_spacyLanguage(pickler, obj):
 
 def _save_transformersPreTrainedTokenizerBase(pickler, obj):
     log(pickler, f"Tok: {obj}")
-    # Ignore the `cache` attribute
-    state = obj.__dict__
+    # Ignore the `cache` attribute and make hashing stable.
+    #
+    # Some tokenizers backed by the `tokenizers` library mutate their internal `_tokenizer` state when called
+    # (e.g. by enabling truncation/padding). This can change the serialized bytes across runs and make dataset
+    # fingerprints unstable, which prevents `.map(load_from_cache_file=True)` from reusing cache files.
+    #
+    # For hashing/fingerprinting, we temporarily disable backend truncation/padding to avoid these runtime settings
+    # affecting the fingerprint, then restore the original settings.
+    state = obj.__dict__.copy()
     if "cache" in state and isinstance(state["cache"], dict):
         state["cache"] = {}
-    pickler.save_reduce(type(obj), (), state=state, obj=obj)
+    if "deprecation_warnings" in state and isinstance(state["deprecation_warnings"], dict):
+        state["deprecation_warnings"] = {}
+
+    backend_tokenizer = obj.__dict__.get("_tokenizer")
+    truncation = padding = None
+    if (
+        backend_tokenizer is not None
+        and hasattr(backend_tokenizer, "truncation")
+        and hasattr(backend_tokenizer, "padding")
+    ):
+        truncation = backend_tokenizer.truncation
+        padding = backend_tokenizer.padding
+        try:
+            if truncation is not None and hasattr(backend_tokenizer, "no_truncation"):
+                backend_tokenizer.no_truncation()
+            if padding is not None and hasattr(backend_tokenizer, "no_padding"):
+                backend_tokenizer.no_padding()
+        except Exception:
+            truncation = padding = None
+
+    try:
+        pickler.save_reduce(type(obj), (), state=state, obj=obj)
+    finally:
+        try:
+            if backend_tokenizer is not None:
+                if truncation is not None and hasattr(backend_tokenizer, "enable_truncation"):
+                    backend_tokenizer.enable_truncation(**truncation)
+                if padding is not None and hasattr(backend_tokenizer, "enable_padding"):
+                    backend_tokenizer.enable_padding(**padding)
+        except Exception:
+            pass
     log(pickler, "# Tok")
 
 

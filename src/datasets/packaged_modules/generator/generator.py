@@ -2,6 +2,8 @@ from dataclasses import dataclass
 from typing import Callable, Optional
 
 import datasets
+from datasets.builder import Key
+from datasets.utils.sharding import _number_of_shards_in_gen_kwargs, _split_gen_kwargs
 
 
 @dataclass
@@ -15,6 +17,11 @@ class GeneratorConfig(datasets.BuilderConfig):
         super().__post_init__()
         if self.generator is None:
             raise ValueError("generator must be specified")
+        if not callable(self.generator):
+            # Otherwise it is only called during generation, and the failure arrives as a
+            # bare "'X' object is not callable" wrapped in a DatasetGenerationError, which
+            # never mentions `generator`. Passing the data itself is an easy mistake.
+            raise TypeError(f"generator must be callable, but got {type(self.generator).__name__}")
 
         if self.gen_kwargs is None:
             self.gen_kwargs = {}
@@ -30,4 +37,7 @@ class Generator(datasets.GeneratorBasedBuilder):
         return [datasets.SplitGenerator(name=self.config.split, gen_kwargs=self.config.gen_kwargs)]
 
     def _generate_examples(self, **gen_kwargs):
-        yield from enumerate(self.config.generator(**gen_kwargs))
+        num_shards = _number_of_shards_in_gen_kwargs(gen_kwargs)
+        for shard_idx, shard_gen_kwargs in enumerate(_split_gen_kwargs(gen_kwargs, max_num_jobs=num_shards)):
+            for sample_idx, sample in enumerate(self.config.generator(**shard_gen_kwargs)):
+                yield Key(shard_idx, sample_idx), sample

@@ -60,9 +60,7 @@ class CsvDatasetReader(AbstractDatasetReader):
                 base_path=base_path,
                 num_proc=self.num_proc,
             )
-            dataset = self.builder.as_dataset(
-                split=self.split, verification_mode=verification_mode, in_memory=self.keep_in_memory
-            )
+            dataset = self.builder.as_dataset(split=self.split, in_memory=self.keep_in_memory)
         return dataset
 
 
@@ -107,7 +105,7 @@ class CsvDatasetWriter:
             key=slice(offset, offset + self.batch_size),
             indices=self.dataset._indices,
         )
-        csv_str = batch.to_pandas().to_csv(
+        csv_str = batch.to_pandas(integer_object_nulls=True).to_csv(
             path_or_buf=None, header=header if (offset == 0) else False, index=index, **to_csv_kwargs
         )
         return csv_str.encode(self.encoding)
@@ -117,6 +115,9 @@ class CsvDatasetWriter:
 
         Caller is responsible for opening and closing the handle.
         """
+        if len(self.dataset) == 0:
+            return file_obj.write(self._batch_csv((0, header, index, to_csv_kwargs)))
+
         written = 0
 
         if self.num_proc is None or self.num_proc == 1:

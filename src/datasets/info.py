@@ -109,7 +109,7 @@ class DatasetInfo:
         features ([`Features`], *optional*):
             The features used to specify the dataset's column types.
         post_processed (`PostProcessedInfo`, *optional*):
-            Information regarding the resources of a possible post-processing of a dataset. For example, it can contain the information of an index.
+            Deprecated. Information regarding the resources of a possible post-processing of a dataset. For example, it can contain the information of an index.
         supervised_keys (`SupervisedKeysData`, *optional*):
             Specifies the input feature and the label for supervised learning if applicable for the dataset (legacy from TFDS).
         builder_name (`str`, *optional*):
@@ -125,11 +125,14 @@ class DatasetInfo:
         download_size (`int`, *optional*):
             The size of the files to download to generate the dataset, in bytes.
         post_processing_size (`int`, *optional*):
-            Size of the dataset in bytes after post-processing, if any.
+            Deprecated. Size of the dataset in bytes after post-processing, if any.
         dataset_size (`int`, *optional*):
             The combined size in bytes of the Arrow tables for all splits.
         size_in_bytes (`int`, *optional*):
             The combined size in bytes of all files associated with the dataset (downloaded files + Arrow files).
+        column_metadata (`dict[str, dict[str, str]]`, *optional*):
+            The metadata of the columns, as a mapping from column name to string keys and values, like the metadata of
+            Arrow fields. It's written in the Arrow field metadata of the Parquet files.
         **config_kwargs (additional keyword arguments):
             Keyword arguments to be passed to the [`BuilderConfig`] and used in the [`DatasetBuilder`].
     """
@@ -140,7 +143,7 @@ class DatasetInfo:
     homepage: str = dataclasses.field(default_factory=str)
     license: str = dataclasses.field(default_factory=str)
     features: Optional[Features] = None
-    post_processed: Optional[PostProcessedInfo] = None
+    post_processed: Optional[PostProcessedInfo] = None  # kept for bawkard compat
     supervised_keys: Optional[SupervisedKeysData] = None
 
     # Set later by the builder
@@ -149,12 +152,14 @@ class DatasetInfo:
     config_name: Optional[str] = None
     version: Optional[Union[str, Version]] = None
     # Set later by `download_and_prepare`
-    splits: Optional[dict] = None
+    splits: Optional[SplitDict] = None
     download_checksums: Optional[dict] = None
     download_size: Optional[int] = None
     post_processing_size: Optional[int] = None
     dataset_size: Optional[int] = None
     size_in_bytes: Optional[int] = None
+    # Set by the user with `Dataset.with_column_metadata`
+    column_metadata: Optional[dict[str, dict[str, str]]] = None
 
     _INCLUDED_INFO_IN_YAML: ClassVar[list[str]] = [
         "config_name",
@@ -234,6 +239,16 @@ class DatasetInfo:
         license = "\n\n".join(unique_values(info.license for info in dataset_infos)).strip()
         features = None
         supervised_keys = None
+        # keep the metadata of a column unless the datasets have different metadata for it
+        column_metadata = {}
+        conflicting_columns = set()
+        for info in dataset_infos:
+            for column, metadata in (info.column_metadata or {}).items():
+                if column_metadata.setdefault(column, metadata) != metadata:
+                    conflicting_columns.add(column)
+        column_metadata = {
+            column: metadata for column, metadata in column_metadata.items() if column not in conflicting_columns
+        }
 
         return cls(
             description=description,
@@ -242,6 +257,7 @@ class DatasetInfo:
             license=license,
             features=features,
             supervised_keys=supervised_keys,
+            column_metadata=column_metadata or None,
         )
 
     @classmethod
@@ -316,9 +332,22 @@ class DatasetInfo:
         if yaml_data.get("features") is not None:
             yaml_data["features"] = Features._from_yaml_list(yaml_data["features"])
         if yaml_data.get("splits") is not None:
-            yaml_data["splits"] = SplitDict._from_yaml_list(yaml_data["splits"])
+            try:
+                yaml_data["splits"] = SplitDict._from_yaml_list(yaml_data["splits"])
+            except ValueError as e:
+                logger.warning(f"Ignoring part of dataset_info from the dataset card: {e}")
         field_names = {f.name for f in dataclasses.fields(cls)}
         return cls(**{k: v for k, v in yaml_data.items() if k in field_names})
+
+    def __repr__(self):
+        return (
+            self.__class__.__qualname__
+            + "("
+            + ", ".join(
+                [f"{f.name}={repr(getattr(self, f.name))}" for f in dataclasses.fields(self) if getattr(self, f.name)]
+            )
+            + ")"
+        )
 
 
 class DatasetInfosDict(dict[str, DatasetInfo]):
